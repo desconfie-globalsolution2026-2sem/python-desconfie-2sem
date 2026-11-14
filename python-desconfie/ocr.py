@@ -4,41 +4,75 @@ from PIL import Image, UnidentifiedImageError
 import pytesseract
 
 # Abre a imagem recebida e extrai o texto com Tesseract
-def extrair_texto_imagem(fluxo_imagem):
+def extrair_texto_imagem(bytes_imagem):
+    try:
+        fluxo = io.BytesIO(bytes_imagem)
 
-    fluxo = io.BytesIO(fluxo_imagem)
+        with Image.open(fluxo) as imagem:
+            imagem = imagem.convert("L")
 
-    with Image.open(fluxo) as imagem:
-        imagem = imagem.convert('L')
+            texto = pytesseract.image_to_string(
+                imagem,
+                lang="por"
+            )
 
-        texto = pytesseract.image_to_string(
-            imagem,
-            lang='por'
-        )
+        return texto
 
-    return texto
+    except (UnidentifiedImageError, OSError, ValueError) as erro:
+        raise ValueError("Imagem inválida ou corrompida.") from erro
+
+    except (
+        pytesseract.TesseractNotFoundError,
+        pytesseract.TesseractError
+    ) as erro:
+        raise RuntimeError(
+            "Falha ao executar o Tesseract OCR."
+        ) from erro
 
 # Valida se a imagem segue as regras de formato exigidos pelo sistema 
 
-def validar_imagem(caminho):
+def validar_imagem(bytes_imagem):
     try:
-        with Image.open(caminho) as img:
+        fluxo = io.BytesIO(bytes_imagem)
 
-            if img.format not in ("PNG", "JPEG"):
-                print("Formato não permitido.")
+        with Image.open(fluxo) as imagem:
+            formato = imagem.format
+
+            if formato not in ("PNG", "JPEG"):
                 return False
 
-            img.verify()
+            imagem.verify()
+
+        # Verifica também se os pixels podem ser decodificados
+        with Image.open(io.BytesIO(bytes_imagem)) as imagem:
+            imagem.load()
 
         return True
 
-    except (UnidentifiedImageError, OSError, SyntaxError) as erro:
-        print(f"Erro ao validar imagem: {erro}")
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
         return False
+
+
+
 
 if __name__ == "__main__":
     resultado = validar_imagem("teste.png")
     print("Resultado da validação:", resultado)
+
+    with open("teste.png", "rb") as arquivo:
+        conteudo = arquivo.read()
+
+    resultado = validar_imagem(conteudo)
+    print("Imagem válida:", resultado)
+
+    if resultado:
+        try:
+            texto = extrair_texto_imagem(conteudo)
+            print("Texto extraído:")
+            print(texto)
+
+        except (ValueError, RuntimeError) as erro:
+            print("Erro:", erro)
 
 
 
