@@ -1,4 +1,3 @@
-
 import io
 from PIL import Image, UnidentifiedImageError
 import pytesseract
@@ -56,9 +55,6 @@ def validar_imagem(bytes_imagem):
 
 
 if __name__ == "__main__":
-    resultado = validar_imagem("teste.png")
-    print("Resultado da validação:", resultado)
-
     with open("teste.png", "rb") as arquivo:
         conteudo = arquivo.read()
 
