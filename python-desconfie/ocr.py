@@ -17,9 +17,6 @@ def extrair_texto_imagem(bytes_imagem):
 
         return texto
 
-    except (UnidentifiedImageError, OSError, ValueError) as erro:
-        raise ValueError("Imagem inválida ou corrompida.") from erro
-
     except (
         pytesseract.TesseractNotFoundError,
         pytesseract.TesseractError
@@ -28,8 +25,10 @@ def extrair_texto_imagem(bytes_imagem):
             "Falha ao executar o Tesseract OCR."
         ) from erro
 
-# Valida se a imagem segue as regras de formato exigidos pelo sistema 
+    except (UnidentifiedImageError, OSError, ValueError) as erro:
+        raise ValueError("Imagem inválida ou corrompida.") from erro
 
+# Valida se a imagem segue as regras de formato exigidos pelo sistema 
 def validar_imagem(bytes_imagem):
     try:
         fluxo = io.BytesIO(bytes_imagem)
