@@ -1,32 +1,27 @@
+
 import io
-import pdfplumber 
-import os
+import pdfplumber
+from pdfminer.pdfparser import PDFSyntaxError
 
 
 def validar_pdf(bytes_pdf):
-     # 1. Verifica se o arquivo existe no caminho informado
-    if not os.path.isfile(caminho_arquivo):
+    # 1. Verifica se o conteúdo possui a assinatura de PDF
+    if not bytes_pdf.startswith(b"%PDF-"):
         return False
 
-    # 2. Verifica os primeiros 5 bytes (assinatura padrão de PDF)
+    # 2. Tenta abrir o PDF em memória
     try:
-        with open(caminho_arquivo, "rb") as f:
-            cabecalho = f.read(5)
-            if cabecalho != b"%PDF-":
-                return False
-    except Exception:
-        return False
+        fluxo = io.BytesIO(bytes_pdf)
 
-    # 3. Tenta abrir com o pdfplumber para garantir que não está corrompido
-    try:
-        with pdfplumber.open(caminho_arquivo) as pdf:
-            # Verifica se há pelo menos uma página legível
-            if len(pdf.pages) == 0:
+        with pdfplumber.open(fluxo) as pdf:
+            # 3. Verifica se existe pelo menos uma página
+            if not pdf.pages:
                 return False
+
         return True
-    except (PDFSyntaxError, Exception):
+
+    except (PDFSyntaxError, OSError, ValueError, TypeError):
         return False
-    pass
 
 
 def extrair_texto_pdf(bytes_pdf):
@@ -42,3 +37,4 @@ def extrair_texto_pdf(bytes_pdf):
                 textos.append(texto)
 
     return "\n".join(textos)
+
