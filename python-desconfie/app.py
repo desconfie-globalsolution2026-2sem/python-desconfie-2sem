@@ -1,30 +1,47 @@
-"""Estrutura inicial da API Flask para recebimento de arquivos."""
+"""API de extração Desconfie: recebe arquivos e consulta o ML externo."""
+
 import os
+import re
+
+import requests
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import MethodNotAllowed, RequestEntityTooLarge
 
+from ocr import extrair_texto_imagem, validar_imagem
+from pdf_reader import extrair_texto_pdf, validar_pdf
+from tratamento import tratar_texto
+from formatador import formatar_resultado
+
+
 LIMITE_UPLOAD_BYTES = 10 * 1024 * 1024
+LIMITE_TEXTO_ML = 5000
+LIMITE_URLS = 10
+ML_URL = os.getenv("ML_URL", "").rstrip("/")
+TIMEOUT_ML = 20
+
 EXTENSOES_PERMITIDAS = {"png", "jpg", "jpeg", "pdf"}
-TIPOS_POR_EXTENSAO = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "pdf": "application/pdf"}
+TIPOS_POR_EXTENSAO = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "pdf": "application/pdf",
+}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = LIMITE_UPLOAD_BYTES
 
 
 def resposta_erro(mensagem, codigo):
-    """Monta uma resposta JSON segura para erros da API."""
     return jsonify({"sucesso": False, "erro": mensagem}), codigo
 
 
 def obter_extensao(nome_arquivo):
-    """Retorna a extensao declarada em minusculas ou uma string vazia."""
     if "." not in nome_arquivo:
         return ""
     return nome_arquivo.rsplit(".", 1)[1].lower()
 
 
 def identificar_tipo_por_assinatura(conteudo):
-    """Identifica PNG, JPEG ou PDF por suas assinaturas basicas de bytes."""
     if conteudo.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if conteudo.startswith(b"\xff\xd8\xff"):
@@ -35,10 +52,10 @@ def identificar_tipo_por_assinatura(conteudo):
 
 
 def validar_upload(nome_arquivo, conteudo):
-    """Valida extensao e assinatura, retornando o tipo MIME confirmado."""
     extensao = obter_extensao(nome_arquivo)
     if extensao not in EXTENSOES_PERMITIDAS:
         raise TypeError("Formato de arquivo nao suportado.")
+
     tipo_esperado = TIPOS_POR_EXTENSAO[extensao]
     tipo_identificado = identificar_tipo_por_assinatura(conteudo)
     if tipo_identificado is None:
@@ -48,41 +65,165 @@ def validar_upload(nome_arquivo, conteudo):
     return tipo_identificado
 
 
+def consultar_ml(caminho, payload):
+    """Retorna o JSON e o status HTTP do serviço de ML."""
+    if not ML_URL:
+        return {"erro": "ML_URL nao foi configurada."}, 503
+
+    try:
+        resposta = requests.post(f"{ML_URL}{caminho}", json=payload, timeout=TIMEOUT_ML)
+        try:
+            dados = resposta.json()
+        except ValueError:
+            return {"erro": "O servico ML devolveu JSON invalido."}, 502
+
+        if not isinstance(dados, dict):
+            return {"erro": "O servico ML devolveu dados inesperados."}, 502
+        if not resposta.ok:
+            app.logger.warning("ML retornou status %s em %s", resposta.status_code, caminho)
+            return {"erro": "A API de ML recusou a requisicao."}, 502
+        return dados, 200
+    except requests.Timeout:
+        return {"erro": "Tempo limite da API de ML excedido."}, 504
+    except requests.RequestException:
+        app.logger.exception("Falha de conexao com o servico ML")
+        return {"erro": "Nao foi possivel acessar a API de ML."}, 502
+
+
+def urls_do_texto(texto):
+    """Identifica URLs únicas no texto completo."""
+    urls = []
+    vistas = set()
+    padrao = (
+        r"(https?://\S+|www\.\S+|"
+        r"\b[\w-]+\.(?:com|net|org|xyz|top|online|"
+        r"site|info|click|ly|gd|br)(?:/\S*)?)"
+    )
+
+    for achado in re.findall(padrao, texto, flags=re.IGNORECASE):
+        url = achado.rstrip(".,;!?)]}>")
+        if url and url not in vistas and len(url) <= LIMITE_TEXTO_ML:
+            vistas.add(url)
+            urls.append(url)
+        if len(urls) >= LIMITE_URLS:
+            break
+    return urls
+
+
 @app.errorhandler(RequestEntityTooLarge)
 def arquivo_muito_grande(erro):
-    """Retorna JSON quando o limite configurado pelo Flask e excedido."""
     return resposta_erro("Arquivo excede o limite de 10 MB.", 413)
 
 
 @app.errorhandler(MethodNotAllowed)
 def metodo_nao_permitido(erro):
-    """Mantem respostas JSON para metodo HTTP invalido."""
     return resposta_erro("Metodo HTTP nao permitido.", 405)
 
 
-@app.route("/extrair", methods=["POST"])
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "mlConfigurado": bool(ML_URL)}), 200
+
+
+@app.post("/prever/texto")
+def prever_texto():
+    dados = request.get_json(silent=True)
+    if not isinstance(dados, dict):
+        return resposta_erro("Envie um objeto JSON.", 400)
+
+    texto = dados.get("texto")
+    if not isinstance(texto, str) or not texto.strip():
+        return resposta_erro("O campo texto e obrigatorio.", 400)
+
+    resultado, codigo = consultar_ml("/prever/texto", {"texto": texto.strip()[:LIMITE_TEXTO_ML]})
+    return jsonify(resultado), codigo
+
+
+@app.post("/prever/url")
+def prever_url():
+    dados = request.get_json(silent=True)
+    if not isinstance(dados, dict):
+        return resposta_erro("Envie um objeto JSON.", 400)
+
+    url = dados.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return resposta_erro("O campo url e obrigatorio.", 400)
+
+    url = url.strip()
+    if len(url) > LIMITE_TEXTO_ML:
+        return resposta_erro("URL acima de 5000 caracteres.", 400)
+
+    resultado, codigo = consultar_ml("/prever/url", {"url": url})
+    return jsonify(resultado), codigo
+
+
+@app.post("/extrair")
 def extrair():
-    """Recebe e valida upload multipart/form-data, sem processar o arquivo."""
+    """Recebe arquivo do Java, extrai texto e consulta o ML."""
     arquivo = request.files.get("arquivo")
     if arquivo is None:
         return resposta_erro("O campo arquivo e obrigatorio.", 400)
-    if arquivo.filename is None or arquivo.filename.strip() == "":
+    if arquivo.filename is None or not arquivo.filename.strip():
         return resposta_erro("O nome do arquivo e obrigatorio.", 400)
+
     try:
         conteudo = arquivo.read()
         if not conteudo:
             return resposta_erro("O arquivo enviado esta vazio.", 400)
         if len(conteudo) > LIMITE_UPLOAD_BYTES:
             return resposta_erro("Arquivo excede o limite de 10 MB.", 413)
-        tipo_arquivo = validar_upload(arquivo.filename, conteudo)
 
-        # Futuramente: ocr.py/pdf_reader.py, tratamento.py e formatador.py.
-        return jsonify({"sucesso": True, "mensagem": "Arquivo recebido e validado com sucesso",
-                        "arquivo": {"nome": arquivo.filename, "tipo": tipo_arquivo}, "status": "RECEBIDO"}), 200
+        tipo_arquivo = validar_upload(arquivo.filename, conteudo)
+        arquivo_id = request.form.get("arquivoId")
+        if arquivo_id not in (None, ""):
+            if not arquivo_id.isdigit():
+                return resposta_erro("arquivoId deve ser numerico.", 400)
+            arquivo_id = int(arquivo_id)
+        else:
+            arquivo_id = None
+
+        if tipo_arquivo in ("image/png", "image/jpeg"):
+            if not validar_imagem(conteudo):
+                return resposta_erro("Imagem invalida ou corrompida.", 422)
+            texto, metodo = extrair_texto_imagem(conteudo), "OCR"
+        elif tipo_arquivo == "application/pdf":
+            if not validar_pdf(conteudo):
+                return resposta_erro("PDF invalido ou corrompido.", 422)
+            texto, metodo = extrair_texto_pdf(conteudo), "PDF_TEXTO"
+        else:
+            return resposta_erro("Formato nao suportado.", 415)
+
+        texto_completo = tratar_texto(texto)
+        if not texto_completo:
+            return resposta_erro("Nenhum texto reconhecido no arquivo.", 422)
+
+        texto_ml = texto_completo[:LIMITE_TEXTO_ML]
+        resultado = formatar_resultado(arquivo_id, arquivo.filename, tipo_arquivo, texto_ml, metodo)
+        resultado["textoTruncadoParaML"] = len(texto_completo) > LIMITE_TEXTO_ML
+        resultado["entradaMLTexto"] = {"texto": texto_ml}
+
+        analise_texto, status = consultar_ml("/prever/texto", {"texto": texto_ml})
+        if status != 200:
+            return resposta_erro(analise_texto["erro"], status)
+
+        analises_urls = []
+        for url in urls_do_texto(texto_completo):
+            analise_url, status = consultar_ml("/prever/url", {"url": url})
+            if status != 200:
+                return resposta_erro(analise_url["erro"], status)
+            analises_urls.append({"url": url, "resultado": analise_url})
+
+        resultado["analiseML"] = {"texto": analise_texto, "urls": analises_urls}
+        return jsonify(resultado), 200
     except TypeError as erro:
         return resposta_erro(str(erro), 415)
+    except ValueError as erro:
+        return resposta_erro(str(erro), 422)
+    except RuntimeError:
+        app.logger.exception("Falha no Tesseract")
+        return resposta_erro("Falha no servico OCR.", 503)
     except Exception:
-        app.logger.exception("Falha inesperada ao validar upload")
+        app.logger.exception("Falha inesperada ao processar o arquivo")
         return resposta_erro("Falha interna inesperada.", 500)
     finally:
         arquivo.close()
