@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: desconfie-extracao
+    runtime: docker
+    # O arquivo versionado usa o nome `dockerfile` em minúsculas.
+    dockerfilePath: ./python-desconfie/dockerfile
+    dockerContext: ./python-desconfie
+    healthCheckPath: /health
+    envVars:
+      - key: ML_URL
+        sync: false
+      - key: TIMEOUT_ML
+        value: "65"

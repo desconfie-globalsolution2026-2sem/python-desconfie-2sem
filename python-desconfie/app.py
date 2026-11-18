@@ -2,10 +2,13 @@
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from http import HTTPStatus
 
 import requests
-from flask import Flask, jsonify, request
-from werkzeug.exceptions import MethodNotAllowed, RequestEntityTooLarge
+from flask import Flask, has_request_context, jsonify, request
+from werkzeug.exceptions import MethodNotAllowed, NotFound, RequestEntityTooLarge
 
 from ocr import extrair_texto_imagem, validar_imagem
 from pdf_reader import extrair_texto_pdf, validar_pdf
@@ -15,9 +18,9 @@ from formatador import formatar_resultado
 
 LIMITE_UPLOAD_BYTES = 10 * 1024 * 1024
 LIMITE_TEXTO_ML = 5000
-LIMITE_URLS = 10
+LIMITE_URLS = 5
 ML_URL = os.getenv("ML_URL", "").rstrip("/")
-TIMEOUT_ML = 20
+TIMEOUT_ML = int(os.getenv("TIMEOUT_ML", "65"))
 
 EXTENSOES_PERMITIDAS = {"png", "jpg", "jpeg", "pdf"}
 TIPOS_POR_EXTENSAO = {
@@ -31,8 +34,19 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = LIMITE_UPLOAD_BYTES
 
 
-def resposta_erro(mensagem, codigo):
-    return jsonify({"sucesso": False, "erro": mensagem}), codigo
+def corpo_erro(mensagem, codigo, *, erro=None, campos=None):
+    return {
+        "status": codigo,
+        "erro": erro or HTTPStatus(codigo).phrase,
+        "mensagem": mensagem,
+        "caminho": request.path if has_request_context() else None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "campos": campos or {},
+    }
+
+
+def resposta_erro(mensagem, codigo, *, erro=None, campos=None):
+    return jsonify(corpo_erro(mensagem, codigo, erro=erro, campos=campos)), codigo
 
 
 def obter_extensao(nome_arquivo):
@@ -68,26 +82,26 @@ def validar_upload(nome_arquivo, conteudo):
 def consultar_ml(caminho, payload):
     """Retorna o JSON e o status HTTP do serviço de ML."""
     if not ML_URL:
-        return {"erro": "ML_URL nao foi configurada."}, 503
+        return corpo_erro("ML_URL nao foi configurada.", 503, erro="ML_NAO_CONFIGURADO"), 503
 
     try:
         resposta = requests.post(f"{ML_URL}{caminho}", json=payload, timeout=TIMEOUT_ML)
         try:
             dados = resposta.json()
         except ValueError:
-            return {"erro": "O servico ML devolveu JSON invalido."}, 502
+            return corpo_erro("O servico ML devolveu JSON invalido.", 502, erro="RESPOSTA_ML_INVALIDA"), 502
 
         if not isinstance(dados, dict):
-            return {"erro": "O servico ML devolveu dados inesperados."}, 502
+            return corpo_erro("O servico ML devolveu dados inesperados.", 502, erro="RESPOSTA_ML_INVALIDA"), 502
         if not resposta.ok:
             app.logger.warning("ML retornou status %s em %s", resposta.status_code, caminho)
-            return {"erro": "A API de ML recusou a requisicao."}, 502
-        return dados, 200
+            return dados, resposta.status_code
+        return dados, resposta.status_code
     except requests.Timeout:
-        return {"erro": "Tempo limite da API de ML excedido."}, 504
+        return corpo_erro("Tempo limite da API de ML excedido.", 504, erro="TIMEOUT_ML"), 504
     except requests.RequestException:
         app.logger.exception("Falha de conexao com o servico ML")
-        return {"erro": "Nao foi possivel acessar a API de ML."}, 502
+        return corpo_erro("Nao foi possivel acessar a API de ML.", 502, erro="ML_INDISPONIVEL"), 502
 
 
 def urls_do_texto(texto):
@@ -101,7 +115,7 @@ def urls_do_texto(texto):
     )
 
     for achado in re.findall(padrao, texto, flags=re.IGNORECASE):
-        url = achado.rstrip(".,;!?)]}>")
+        url = achado.rstrip(".,;)")
         if url and url not in vistas and len(url) <= LIMITE_TEXTO_ML:
             vistas.add(url)
             urls.append(url)
@@ -120,9 +134,19 @@ def metodo_nao_permitido(erro):
     return resposta_erro("Metodo HTTP nao permitido.", 405)
 
 
+@app.errorhandler(NotFound)
+def rota_nao_encontrada(erro):
+    return resposta_erro("Rota nao encontrada.", 404)
+
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "mlConfigurado": bool(ML_URL)}), 200
+
+
+@app.get("/")
+def indice():
+    return jsonify({"servico": "desconfie-extracao", "status": "ok"}), 200
 
 
 @app.post("/prever/texto")
@@ -135,7 +159,16 @@ def prever_texto():
     if not isinstance(texto, str) or not texto.strip():
         return resposta_erro("O campo texto e obrigatorio.", 400)
 
-    resultado, codigo = consultar_ml("/prever/texto", {"texto": texto.strip()[:LIMITE_TEXTO_ML]})
+    texto = texto.strip()
+    if len(texto) > LIMITE_TEXTO_ML:
+        return resposta_erro(
+            f"Texto acima de {LIMITE_TEXTO_ML} caracteres.",
+            400,
+            erro="TEXTO_MUITO_LONGO",
+            campos={"texto": f"maximo de {LIMITE_TEXTO_ML} caracteres"},
+        )
+
+    resultado, codigo = consultar_ml("/prever/texto", {"texto": texto})
     return jsonify(resultado), codigo
 
 
@@ -198,22 +231,49 @@ def extrair():
             return resposta_erro("Nenhum texto reconhecido no arquivo.", 422)
 
         texto_ml = texto_completo[:LIMITE_TEXTO_ML]
-        resultado = formatar_resultado(arquivo_id, arquivo.filename, tipo_arquivo, texto_ml, metodo)
+        resultado = formatar_resultado(arquivo_id, arquivo.filename, tipo_arquivo, texto_completo, metodo)
         resultado["textoTruncadoParaML"] = len(texto_completo) > LIMITE_TEXTO_ML
-        resultado["entradaMLTexto"] = {"texto": texto_ml}
 
         analise_texto, status = consultar_ml("/prever/texto", {"texto": texto_ml})
-        if status != 200:
-            return resposta_erro(analise_texto["erro"], status)
 
-        analises_urls = []
-        for url in urls_do_texto(texto_completo):
-            analise_url, status = consultar_ml("/prever/url", {"url": url})
-            if status != 200:
-                return resposta_erro(analise_url["erro"], status)
-            analises_urls.append({"url": url, "resultado": analise_url})
+        # A extração é útil mesmo quando o ML está indisponível. A classificação
+        # é, portanto, registrada como parcial em vez de invalidar a resposta.
+        resultado["analiseML"] = {
+            "texto": {"status": status, "resultado": analise_texto},
+            "urls": [],
+        }
 
-        resultado["analiseML"] = {"texto": analise_texto, "urls": analises_urls}
+        if status == 200:
+            urls = urls_do_texto(texto_completo)
+            # Chamadas independentes: uma URL lenta ou inválida não bloqueia as demais.
+            with ThreadPoolExecutor(max_workers=LIMITE_URLS) as executor:
+                futuros = {
+                    executor.submit(consultar_ml, "/prever/url", {"url": url}): (indice, url)
+                    for indice, url in enumerate(urls)
+                }
+                analises_urls = [None] * len(futuros)
+
+                for futuro in as_completed(futuros):
+                    indice, url = futuros[futuro]
+                    try:
+                        analise_url, status_url = futuro.result()
+                    except Exception:
+                        app.logger.exception("Falha inesperada ao consultar URL no ML")
+                        analise_url = corpo_erro(
+                            "Falha inesperada ao consultar URL no ML.",
+                            502,
+                            erro="ML_INDISPONIVEL",
+                        )
+                        status_url = 502
+
+                    analises_urls[indice] = {
+                        "url": url,
+                        "status": status_url,
+                        "resultado": analise_url,
+                    }
+
+            resultado["analiseML"]["urls"] = analises_urls
+
         return jsonify(resultado), 200
     except TypeError as erro:
         return resposta_erro(str(erro), 415)

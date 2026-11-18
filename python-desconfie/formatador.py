@@ -29,13 +29,17 @@ def formatar_resultado(arquivo_id, nome_arquivo, tipo_arquivo, texto, metodo):
     O campo entradaMLTexto fornece o corpo exato do POST /prever/texto.
     A classificação de fraude NÃO é realizada aqui.
     """
-    entrada_ml = formatar_para_ml_texto(texto)
+    if not isinstance(texto, str) or not texto.strip():
+        raise ValueError("O texto extraido deve conter texto nao vazio.")
+
+    texto_extraido = texto.strip()
+    entrada_ml = {"texto": texto_extraido[:LIMITE_CARACTERES_ML]}
     return {
         "sucesso": True,
         "arquivoId": arquivo_id,
         "nomeArquivo": nome_arquivo,
         "tipoArquivo": tipo_arquivo,
-        "textoExtraido": entrada_ml["texto"],
+        "textoExtraido": texto_extraido,
         "metodoExtracao": metodo,
         "entradaMLTexto": entrada_ml,
     }
